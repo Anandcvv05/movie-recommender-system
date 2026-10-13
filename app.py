@@ -52,26 +52,6 @@ st.markdown("""
         color: #ded8f5;
     }
 
-    .metric-card {
-        background: #201d30;
-        border: 1px solid #39344d;
-        padding: 20px;
-        border-radius: 16px;
-        min-height: 110px;
-    }
-
-    .metric-label {
-        color: #bdb6d5;
-        font-size: 14px;
-    }
-
-    .metric-value {
-        color: #ffffff;
-        font-size: 29px;
-        font-weight: 700;
-        margin-top: 8px;
-    }
-
     .movie-card {
         background: #201d30;
         border: 1px solid #3b3452;
@@ -115,73 +95,96 @@ st.markdown("""
 
 
 # =====================================================
-# DATA LOADING
+# LOAD DATA
 # =====================================================
 @st.cache_data(show_spinner=False)
 def load_data():
     ratings = pd.read_csv(BASE_DIR / "ratings.csv")
     movies = pd.read_csv(BASE_DIR / "movies.csv")
 
-    ratings = ratings.dropna(subset=["userId", "movieId", "rating"])
-    movies = movies.dropna(subset=["movieId", "title"])
+    required_ratings = {"userId", "movieId", "rating"}
+    required_movies = {"movieId", "title", "genres"}
+
+    if not required_ratings.issubset(ratings.columns):
+        raise ValueError(
+            "ratings.csv must contain userId, movieId and rating."
+        )
+
+    if not required_movies.issubset(movies.columns):
+        raise ValueError(
+            "movies.csv must contain movieId, title and genres."
+        )
+
+    ratings = ratings.dropna(
+        subset=["userId", "movieId", "rating"]
+    ).copy()
+
+    movies = movies.dropna(
+        subset=["movieId", "title"]
+    ).copy()
+
     ratings["userId"] = ratings["userId"].astype(int)
     ratings["movieId"] = ratings["movieId"].astype(int)
     movies["movieId"] = movies["movieId"].astype(int)
 
+    movies["genres"] = movies["genres"].fillna(
+        "(no genres listed)"
+    )
+
     return ratings, movies
-
-
-@st.cache_data(show_spinner="Preparing movie similarity model...")
-def build_model(ratings):
-    matrix = ratings.pivot_table(
-        index="userId",
-        columns="movieId",
-        values="rating"
-    )
-
-    user_means = matrix.mean(axis=1)
-    centered = matrix.sub(user_means, axis=0).fillna(0)
-
-    similarities = cosine_similarity(centered)
-
-    similarity_df = pd.DataFrame(
-        similarities,
-        index=matrix.index,
-        columns=matrix.index
-    )
-
-    return matrix, user_means, similarity_df
 
 
 try:
     ratings, movies = load_data()
 
     if ratings.empty or movies.empty:
-        st.error("The dataset is empty. Please check your CSV files.")
-        st.stop()
-
-    if not {"userId", "movieId", "rating"}.issubset(ratings.columns):
-        st.error("ratings.csv must contain userId, movieId and rating.")
-        st.stop()
-
-    if not {"movieId", "title", "genres"}.issubset(movies.columns):
-        st.error("movies.csv must contain movieId, title and genres.")
+        st.error("The dataset is empty. Check your CSV files.")
         st.stop()
 
 except Exception as exc:
-    st.error(f"Could not load the MovieLens files: {exc}")
-    st.info("Keep ratings.csv and movies.csv in the same folder as app.py.")
+    st.error(f"Unable to load the dataset: {exc}")
+    st.info(
+        "Keep ratings.csv and movies.csv in the same folder as app.py."
+    )
     st.stop()
+
+
+# =====================================================
+# BUILD USER SIMILARITY MODEL
+# =====================================================
+@st.cache_data(show_spinner="Preparing recommendation model...")
+def build_model(ratings):
+    rating_matrix = ratings.pivot_table(
+        index="userId",
+        columns="movieId",
+        values="rating"
+    )
+
+    user_means = rating_matrix.mean(axis=1)
+
+    centered_matrix = rating_matrix.sub(
+        user_means, axis=0
+    ).fillna(0)
+
+    similarity_values = cosine_similarity(centered_matrix)
+
+    similarity_df = pd.DataFrame(
+        similarity_values,
+        index=rating_matrix.index,
+        columns=rating_matrix.index
+    )
+
+    return rating_matrix, user_means, similarity_df
 
 
 matrix, user_means, similarity_df = build_model(ratings)
 
-movie_lookup = movies.drop_duplicates("movieId").set_index("movieId")
 user_ids = sorted(matrix.index.tolist())
+
 genre_options = sorted({
     genre
-    for value in movies["genres"].fillna("")
-    for genre in value.split("|")
+    for value in movies["genres"]
+    for genre in str(value).split("|")
     if genre and genre != "(no genres listed)"
 })
 
@@ -189,13 +192,18 @@ genre_options = sorted({
 # =====================================================
 # RECOMMENDATION ENGINE
 # =====================================================
-def recommend_movies(user_id, top_n=10, neighbor_count=20,
-                     selected_genres=None, min_rating=0.5):
-
+def recommend_movies(
+    user_id,
+    top_n=10,
+    neighbor_count=20,
+    selected_genres=None,
+    min_rating=3.0
+):
     if user_id not in matrix.index:
         return pd.DataFrame()
 
     known_ratings = matrix.loc[user_id].dropna()
+
     if known_ratings.empty:
         return pd.DataFrame()
 
@@ -203,9 +211,11 @@ def recommend_movies(user_id, top_n=10, neighbor_count=20,
         index=user_id, errors="ignore"
     )
 
-    neighbors = similarities.sort_values(ascending=False).head(
-        neighbor_count
-    )
+    neighbors = similarities.sort_values(
+        ascending=False
+    ).head(neighbor_count)
+
+    # Use only positively similar users
     neighbors = neighbors[neighbors > 0]
 
     if neighbors.empty:
@@ -214,30 +224,42 @@ def recommend_movies(user_id, top_n=10, neighbor_count=20,
     neighbor_matrix = matrix.loc[neighbors.index]
     neighbor_means = user_means.loc[neighbors.index]
 
-    # Calculate each neighbor's rating deviation from their average.
-    deviations = neighbor_matrix.sub(neighbor_means, axis=0).fillna(0)
+    # Center each neighbor's ratings around their personal average
+    deviations = neighbor_matrix.sub(
+        neighbor_means, axis=0
+    ).fillna(0)
 
-    # Use only ratings that actually exist when computing each score.
     observed = neighbor_matrix.notna().astype(float)
-    weights = neighbors.abs()
 
     numerator = deviations.T.dot(neighbors)
-    denominator = observed.T.dot(weights)
 
+    denominator = observed.T.dot(neighbors.abs())
+
+    # Predict using the target user's average plus weighted deviations
     predicted = (
         user_means.loc[user_id]
         + numerator / denominator.replace(0, np.nan)
     )
 
-    # Never recommend movies already rated by the target user.
+    # Exclude movies already rated by this user
     predicted = predicted.drop(
-        index=known_ratings.index, errors="ignore"
+        index=known_ratings.index,
+        errors="ignore"
     )
+
     predicted = predicted.dropna().clip(0.5, 5.0)
 
-    result = predicted.rename("Predicted Rating").reset_index()
+    result = predicted.rename(
+        "Predicted Rating"
+    ).reset_index()
+
     result.columns = ["movieId", "Predicted Rating"]
-    result = result.merge(movies, on="movieId", how="inner")
+
+    result = result.merge(
+        movies[["movieId", "title", "genres"]],
+        on="movieId",
+        how="inner"
+    )
 
     if selected_genres:
         result = result[
@@ -249,10 +271,14 @@ def recommend_movies(user_id, top_n=10, neighbor_count=20,
             )
         ]
 
-    result = result[result["Predicted Rating"] >= min_rating]
+    result = result[
+        result["Predicted Rating"] >= min_rating
+    ]
 
     return (
-        result.sort_values("Predicted Rating", ascending=False)
+        result.sort_values(
+            "Predicted Rating", ascending=False
+        )
         .head(top_n)
         .reset_index(drop=True)
     )
@@ -272,19 +298,25 @@ with st.sidebar:
         format_func=lambda uid: f"User {uid}"
     )
 
-    top_n = st.slider(
+    # Number input with increment/decrement arrows
+    top_n = int(st.number_input(
         "Number of recommendations",
         min_value=5,
         max_value=20,
-        value=10
-    )
+        value=10,
+        step=1,
+        help="Choose how many movies to recommend."
+    ))
 
-    neighbor_count = st.slider(
+    # Number input with increment/decrement arrows
+    neighbor_count = int(st.number_input(
         "Similar users to consider",
         min_value=5,
         max_value=50,
-        value=20
-    )
+        value=20,
+        step=1,
+        help="Choose how many similar users influence predictions."
+    ))
 
     st.divider()
     st.markdown("### 🎭 Genre preferences")
@@ -295,15 +327,16 @@ with st.sidebar:
         placeholder="All genres"
     )
 
-    min_rating = st.slider(
+    min_rating = st.select_slider(
         "Minimum predicted rating",
-        min_value=0.5,
-        max_value=5.0,
-        value=3.0,
-        step=0.5
+        options=[0.5, 1.0, 1.5, 2.0, 2.5,
+                 3.0, 3.5, 4.0, 4.5, 5.0],
+        value=3.0
     )
 
-    st.caption("Filters apply to recommendations, not model training.")
+    st.caption(
+        "Filters affect displayed recommendations, not model training."
+    )
 
 
 # =====================================================
@@ -312,9 +345,8 @@ with st.sidebar:
 st.markdown("""
 <div class="hero">
     <h1>🎬 CineMatch</h1>
-    <p>Discover your next favourite movie through the power of
-    collaborative filtering.</p>
-    <p>Recommendations are based on users with similar rating patterns.</p>
+    <p>Discover your next favourite movie through collaborative filtering.</p>
+    <p>Explore recommendations based on users with similar rating patterns.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -324,16 +356,31 @@ st.markdown("""
 # =====================================================
 c1, c2, c3, c4 = st.columns(4)
 
-c1.metric("🎞️ Movies", f"{movies['movieId'].nunique():,}")
-c2.metric("⭐ Ratings", f"{len(ratings):,}")
-c3.metric("👥 Users", f"{ratings['userId'].nunique():,}")
-c4.metric("📊 Average rating", f"{ratings['rating'].mean():.2f}/5")
+c1.metric(
+    "🎞️ Movies",
+    f"{movies['movieId'].nunique():,}"
+)
+
+c2.metric(
+    "⭐ Ratings",
+    f"{len(ratings):,}"
+)
+
+c3.metric(
+    "👥 Users",
+    f"{ratings['userId'].nunique():,}"
+)
+
+c4.metric(
+    "📊 Average rating",
+    f"{ratings['rating'].mean():.2f}/5"
+)
 
 st.write("")
 
 
 # =====================================================
-# TABS
+# NAVIGATION TABS
 # =====================================================
 tab_recommend, tab_discover, tab_history, tab_insights = st.tabs([
     "✨ For You",
@@ -344,35 +391,34 @@ tab_recommend, tab_discover, tab_history, tab_insights = st.tabs([
 
 
 # =====================================================
-# TAB 1: RECOMMENDATIONS
+# TAB 1: PERSONALIZED RECOMMENDATIONS
 # =====================================================
 with tab_recommend:
     st.subheader(f"Recommended for User {selected_user}")
+
     st.markdown(
-        '<p class="section-caption">Ranked using ratings from similar users. '
-        'Predictions are estimates, not guaranteed preferences.</p>',
+        '<p class="section-caption">'
+        'Recommendations are estimates based on similar users, '
+        'not guaranteed preferences.'
+        '</p>',
         unsafe_allow_html=True
     )
 
-    if st.button("✨ Generate Recommendations", type="primary",
-                 key="generate_recommendations"):
-
+    if st.button(
+        "✨ Generate Recommendations",
+        type="primary",
+        key="generate_recommendations"
+    ):
         results = recommend_movies(
-            selected_user,
-            top_n,
-            neighbor_count,
-            selected_genres,
-            min_rating
+            user_id=selected_user,
+            top_n=top_n,
+            neighbor_count=neighbor_count,
+            selected_genres=selected_genres,
+            min_rating=min_rating
         )
 
-        if results.empty:
-            st.warning(
-                "No recommendations match these filters. Try selecting "
-                "more genres or lowering the minimum predicted rating."
-            )
-        else:
-            st.session_state["recommendation_results"] = results
-            st.session_state["recommendation_user"] = selected_user
+        st.session_state["recommendation_results"] = results
+        st.session_state["recommendation_user"] = selected_user
 
     if (
         "recommendation_results" in st.session_state
@@ -381,15 +427,21 @@ with tab_recommend:
         results = st.session_state["recommendation_results"]
 
         if results.empty:
-            st.info("No recommendations to display.")
+            st.warning(
+                "No recommendations match these settings. "
+                "Try removing genre filters or lowering the minimum rating."
+            )
         else:
-            st.success(f"Found {len(results)} movie recommendations.")
+            st.success(
+                f"Found {len(results)} movie recommendations."
+            )
 
             for start in range(0, len(results), 2):
                 cols = st.columns(2)
 
                 for col, (_, movie) in zip(
-                    cols, results.iloc[start:start + 2].iterrows()
+                    cols,
+                    results.iloc[start:start + 2].iterrows()
                 ):
                     with col:
                         st.markdown(
@@ -418,8 +470,11 @@ with tab_recommend:
             )
 
             with st.expander("View recommendations as a table"):
-                st.dataframe(results, hide_index=True, use_container_width=True)
-
+                st.dataframe(
+                    results,
+                    hide_index=True,
+                    use_container_width=True
+                )
     else:
         st.info(
             "Choose your preferences in the sidebar and click "
@@ -432,6 +487,7 @@ with tab_recommend:
 # =====================================================
 with tab_discover:
     st.subheader("Explore the MovieLens library")
+
     search_text = st.text_input(
         "🔎 Search movie titles",
         placeholder="Example: Toy Story, Matrix, Titanic..."
@@ -448,7 +504,10 @@ with tab_discover:
     if search_text.strip():
         catalog = catalog[
             catalog["title"].str.contains(
-                search_text.strip(), case=False, na=False, regex=False
+                search_text.strip(),
+                case=False,
+                na=False,
+                regex=False
             )
         ]
 
@@ -465,20 +524,35 @@ with tab_discover:
     st.caption(f"{len(catalog):,} matching movies")
 
     if catalog.empty:
-        st.warning("No movies match your search. Try another title or genre.")
+        st.warning(
+            "No movies match your search. Try another title or genre."
+        )
     else:
-        # Attach actual dataset rating statistics.
         stats = ratings.groupby("movieId").agg(
             Average_Rating=("rating", "mean"),
             Number_of_Ratings=("rating", "count")
         ).reset_index()
 
-        catalog = catalog.merge(stats, on="movieId", how="left")
-        catalog["Average_Rating"] = catalog["Average_Rating"].round(2)
+        catalog = catalog.merge(
+            stats,
+            on="movieId",
+            how="left"
+        )
+
+        catalog["Average_Rating"] = catalog[
+            "Average_Rating"
+        ].round(2)
+
+        catalog["Number_of_Ratings"] = catalog[
+            "Number_of_Ratings"
+        ].fillna(0).astype(int)
 
         st.dataframe(
             catalog[[
-                "title", "genres", "Average_Rating", "Number_of_Ratings"
+                "title",
+                "genres",
+                "Average_Rating",
+                "Number_of_Ratings"
             ]].rename(columns={
                 "title": "Movie",
                 "genres": "Genres",
@@ -491,12 +565,14 @@ with tab_discover:
 
 
 # =====================================================
-# TAB 3: RATING HISTORY
+# TAB 3: USER RATING HISTORY
 # =====================================================
 with tab_history:
     st.subheader(f"Rating history for User {selected_user}")
 
-    history = ratings[ratings["userId"] == selected_user].merge(
+    history = ratings[
+        ratings["userId"] == selected_user
+    ].merge(
         movies[["movieId", "title", "genres"]],
         on="movieId",
         how="left"
@@ -506,18 +582,31 @@ with tab_history:
         st.info("No rating history is available.")
     else:
         hc1, hc2, hc3 = st.columns(3)
-        hc1.metric("Movies rated", len(history))
-        hc2.metric("Average rating given", f"{history['rating'].mean():.2f}")
-        hc3.metric("Highly rated movies", int((history["rating"] >= 4).sum()))
 
-        history = history.sort_values("rating", ascending=False)
+        hc1.metric("Movies rated", len(history))
+
+        hc2.metric(
+            "Average rating given",
+            f"{history['rating'].mean():.2f}"
+        )
+
+        hc3.metric(
+            "Highly rated movies",
+            int((history["rating"] >= 4).sum())
+        )
+
+        history = history.sort_values(
+            "rating", ascending=False
+        )
 
         st.dataframe(
-            history[["title", "genres", "rating"]].rename(columns={
-                "title": "Movie",
-                "genres": "Genres",
-                "rating": "Your rating"
-            }),
+            history[["title", "genres", "rating"]].rename(
+                columns={
+                    "title": "Movie",
+                    "genres": "Genres",
+                    "rating": "Your rating"
+                }
+            ),
             use_container_width=True,
             hide_index=True
         )
@@ -531,7 +620,7 @@ with tab_history:
 
 
 # =====================================================
-# TAB 4: INSIGHTS
+# TAB 4: DATASET INSIGHTS
 # =====================================================
 with tab_insights:
     st.subheader("Dataset insights")
@@ -540,19 +629,25 @@ with tab_insights:
 
     with left:
         st.markdown("#### Rating distribution")
+
         fig, ax = plt.subplots(figsize=(7, 4))
+
         ratings["rating"].value_counts().sort_index().plot(
-            kind="bar", ax=ax
+            kind="bar",
+            ax=ax
         )
+
         ax.set_xlabel("Rating")
         ax.set_ylabel("Number of ratings")
         ax.set_title("Distribution of MovieLens Ratings")
         ax.grid(axis="y", alpha=0.2)
+
         st.pyplot(fig)
         plt.close(fig)
 
     with right:
         st.markdown("#### Most-rated movies")
+
         popular = (
             ratings.groupby("movieId")
             .agg(
@@ -560,35 +655,43 @@ with tab_insights:
                 average_rating=("rating", "mean")
             )
             .reset_index()
-            .merge(movies[["movieId", "title"]], on="movieId")
+            .merge(
+                movies[["movieId", "title"]],
+                on="movieId",
+                how="left"
+            )
             .sort_values("rating_count", ascending=False)
             .head(10)
         )
 
+        popular["average_rating"] = popular[
+            "average_rating"
+        ].round(2)
+
         st.dataframe(
-            popular[["title", "rating_count", "average_rating"]].rename(
-                columns={
-                    "title": "Movie",
-                    "rating_count": "Number of ratings",
-                    "average_rating": "Average rating"
-                }
-            ).round(2),
+            popular[[
+                "title", "rating_count", "average_rating"
+            ]].rename(columns={
+                "title": "Movie",
+                "rating_count": "Number of ratings",
+                "average_rating": "Average rating"
+            }),
             hide_index=True,
             use_container_width=True
         )
 
-    st.markdown("#### Method used")
+    st.markdown("#### Recommendation methodology")
+
     st.write(
-        "The system centers each user's ratings around their personal "
-        "average, computes cosine similarity between user profiles, "
-        "and predicts unseen movie ratings using similarity-weighted "
-        "rating deviations."
+        "The system centers user ratings around personal averages, "
+        "computes cosine similarity between users, selects positively "
+        "similar neighbors, and predicts unseen ratings using "
+        "similarity-weighted rating deviations."
     )
 
     st.caption(
-        "Dataset: MovieLens Small. The displayed statistics are calculated "
-        "from the provided CSV files. This interface does not fetch movie "
-        "posters or external movie metadata."
+        "Dataset: MovieLens Small. Statistics are calculated from the "
+        "local CSV files. Movie posters and external metadata are not fetched."
     )
 
 
@@ -596,7 +699,8 @@ with tab_insights:
 # FOOTER
 # =====================================================
 st.divider()
+
 st.caption(
     "CineMatch • Movie Recommender System • "
-    "Built with Python, Pandas, Scikit-learn and Streamlit"
+    "Python, Pandas, Scikit-learn and Streamlit"
 )
